@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    restart: always
+    volumes:
+      - ./downloads:/app/downloads
+      - ./.env:/app/.env
+      - ./story_session.session:/app/story_session.session
