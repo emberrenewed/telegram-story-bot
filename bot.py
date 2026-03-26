@@ -6,14 +6,15 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.tl.functions.stories import GetPeerStoriesRequest
+from telethon.sessions import StringSession
+from telethon.tl.functions.stories import GetPeerStoriesRequest, GetPinnedStoriesRequest
 from telethon.tl.functions.contacts import ResolveUsernameRequest
 from telethon.errors import (
     UsernameNotOccupiedError,
     UsernameInvalidError,
     FloodWaitError,
 )
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -29,11 +30,11 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Max parallel downloads at once
 MAX_CONCURRENT = 5
 
 logging.basicConfig(
@@ -42,7 +43,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-user_client = TelegramClient("story_session", API_ID, API_HASH)
+if SESSION_STRING:
+    user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+else:
+    user_client = TelegramClient("story_session", API_ID, API_HASH)
+
+# Inline buttons under every media
+BUTTONS = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("📩 Developer", url="https://t.me/emberdev"),
+        InlineKeyboardButton("🌐 Website", url="https://ahmadmuhammet.netlify.app/"),
+    ]
+])
 
 
 async def init_user_client():
@@ -75,25 +87,30 @@ async def send_media_file(update, file_path: Path, caption: str):
     with open(file_path, "rb") as f:
         if ext in (".mp4", ".mov", ".avi", ".mkv"):
             await update.message.reply_video(
-                video=f, caption=caption,
+                video=f, caption=caption, reply_markup=BUTTONS,
                 read_timeout=120, write_timeout=120,
             )
         elif ext in (".jpg", ".jpeg", ".png", ".webp"):
-            await update.message.reply_photo(photo=f, caption=caption)
+            await update.message.reply_photo(
+                photo=f, caption=caption, reply_markup=BUTTONS,
+            )
         elif ext == ".gif":
-            await update.message.reply_animation(animation=f, caption=caption)
+            await update.message.reply_animation(
+                animation=f, caption=caption, reply_markup=BUTTONS,
+            )
         else:
-            await update.message.reply_document(document=f, caption=caption)
+            await update.message.reply_document(
+                document=f, caption=caption, reply_markup=BUTTONS,
+            )
 
 
 async def download_one(semaphore, media, dest: str):
-    """Download a single media file with concurrency control."""
     async with semaphore:
         path = await user_client.download_media(media, file=dest)
         return Path(path) if path else None
 
 
-# ─── Stories (parallel download) ───────────────────────────
+# ─── Stories (active + pinned/old) ────────────────────────
 
 async def fetch_and_send_stories(update: Update, username: str):
     status_msg = await update.message.reply_text(f"🔍 Searching for @{username} ...")
@@ -106,51 +123,61 @@ async def fetch_and_send_stories(update: Update, username: str):
     display_name = get_display_name(entity)
     await status_msg.edit_text(f"📥 Fetching stories for {display_name} (@{username}) ...")
 
-    try:
-        stories_result = await user_client(GetPeerStoriesRequest(peer=entity))
-    except FloodWaitError as e:
-        await status_msg.edit_text(f"Rate limited. Wait {e.seconds}s.")
-        return
-    except Exception as e:
-        await status_msg.edit_text(f"Error fetching stories: {e}")
-        return
+    all_stories = []
 
-    stories = stories_result.stories
-    if not stories or not stories.stories:
+    # 1. Active stories
+    try:
+        result = await user_client(GetPeerStoriesRequest(peer=entity))
+        if result.stories and result.stories.stories:
+            for s in result.stories.stories:
+                all_stories.append(("active", s))
+    except Exception as e:
+        logger.warning(f"Error fetching active stories: {e}")
+
+    # 2. Pinned/old stories
+    try:
+        pinned = await user_client(GetPinnedStoriesRequest(peer=entity, offset_id=0, limit=100))
+        if pinned.stories:
+            active_ids = {s.id for _, s in all_stories}
+            for s in pinned.stories:
+                if s.id not in active_ids:
+                    all_stories.append(("pinned", s))
+    except Exception as e:
+        logger.warning(f"Error fetching pinned stories: {e}")
+
+    if not all_stories:
         await status_msg.edit_text(f"No stories found for @{username}.")
         return
 
-    story_list = stories.stories
-    total = len(story_list)
+    total = len(all_stories)
     await status_msg.edit_text(f"⬇️ Downloading {total} stories...")
 
-    # Parallel download all stories
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     file_dir = DOWNLOAD_DIR / username
     file_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     tasks = []
-    story_meta = []
-    for i, story in enumerate(story_list):
+    meta = []
+    for i, (stype, story) in enumerate(all_stories):
         if story.media is None:
             continue
         dest = str(file_dir / f"story_{i}_{ts}")
         tasks.append(download_one(semaphore, story.media, dest))
-        story_meta.append((i, story))
+        meta.append((i, stype, story))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     await status_msg.edit_text(f"📤 Sending {total} stories...")
 
-    # Send all downloaded files
     sent_count = 0
-    for (i, story), result in zip(story_meta, results):
+    for (i, stype, story), result in zip(meta, results):
         if isinstance(result, Exception) or result is None:
             continue
         file_path = result
         try:
-            caption = f"📖 Story {i + 1}/{total} — @{username}"
+            label = "📖 Story" if stype == "active" else "📌 Pinned Story"
+            caption = f"{label} {i + 1}/{total} — @{username}"
             if hasattr(story, "date") and story.date:
                 caption += f"\n📅 {story.date.strftime('%Y-%m-%d %H:%M UTC')}"
 
@@ -207,7 +234,6 @@ async def fetch_and_send_posts(update: Update, username: str, limit: int = 20):
     total = len(messages)
     await status_msg.edit_text(f"⬇️ Downloading {total} posts...")
 
-    # Parallel download all posts
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     file_dir = DOWNLOAD_DIR / username
     file_dir.mkdir(parents=True, exist_ok=True)
@@ -274,11 +300,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Welcome! Commands:\n\n"
-        "/stories username — Fetch stories\n"
-        "/posts username — Fetch last 20 media posts\n"
-        "/posts username 50 — Fetch last 50 posts\n"
+        "/stories username — Active + pinned stories\n"
+        "/posts username — Last 20 media posts\n"
+        "/posts username 50 — Last 50 posts\n"
         "/all username — Stories + posts\n\n"
-        "Or just send a username to get stories."
+        "Or just send a username to get stories.",
+        reply_markup=BUTTONS,
     )
 
 
